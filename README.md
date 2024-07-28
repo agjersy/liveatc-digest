@@ -1,2 +1,2 @@
-# live-atc-digest
-Automatic voice transcription of queried LiveATC recordings with GPT summarization.
+# liveatc-digest
+Automatic voice transcription of queried LiveATC.net archived recordings with GPT summarization.
