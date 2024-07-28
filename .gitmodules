@@ -1,0 +1,3 @@
+[submodule "liveatc_downloader"]
+	path = liveatc_downloader
+	url = git@github.com:agjersy/liveatc-downloader.git
