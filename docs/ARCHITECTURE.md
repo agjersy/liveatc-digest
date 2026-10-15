@@ -1,6 +1,7 @@
 # LiveATC Digest — System Design (Workshop Draft v0.1)
 
-Status: **draft for discussion**. Nothing here is final; open questions are collected at the end.
+Status: **draft for discussion**. Decisions taken so far are logged in §12; remaining open
+questions are in §11.
 
 This document describes the target architecture for turning the current `ingest.py`
 prototype into three layered products that share one engine:
@@ -100,8 +101,10 @@ Keys are stored in the OS keychain (`keyring`), never in the database or project
 ### 3.3 Licensing and terms to respect
 
 - LiveATC: personal use; no redistribution of audio. We cache locally and export only derived text.
-- adsb.lol history: ODbL. Derived databases that are shared must carry attribution and share-alike.
-- ADS-B Exchange: no bulk resale/redistribution.
+- adsb.lol history: ODbL. **Retrieved ADS-B point data is never exported** from the tool
+  (no CSV/GeoJSON/KML of positions, and the per-case database is not a sharing format).
+  Exports contain only rendered map figures and derived event text, with attribution.
+- ADS-B Exchange: no bulk resale/redistribution (same no-export rule applies).
 - OpenSky: non-commercial research only; must not be the default adapter.
 - NTSB, FAA, eCFR: US government works, public domain.
 
@@ -128,9 +131,9 @@ Keys are stored in the OS keychain (`keyring`), never in the database or project
   - `openai`: existing cloud path.
   - Others added behind the same interface.
 - Output per utterance: text, start/end UTC, feed, ASR confidence, provider + model id.
-- "Translate" in the original brief is interpreted as **transcription** plus optional
-  plain-language **normalization** of phraseology (e.g. "cleared ILS two-seven approach"
-  → structured clearance). True language translation is a later optional step.
+- "Translate" means **transcription to English** plus **phraseology normalization**
+  (e.g. "cleared ILS two-seven approach" → structured clearance). Translation into other
+  languages is out of scope.
 
 ### 4.3 `nlp`
 - Callsign extraction: airline telephony → ICAO designator (from the FAA/ICAO telephony
@@ -182,8 +185,13 @@ Keys are stored in the OS keychain (`keyring`), never in the database or project
   contain.
 
 ### 4.8 `store`
-- SQLite single-file database per workspace (portable, zero-config), FTS5 for transcript and
-  report search. Postgres is a later option behind the same repository layer.
+- **One SQLite file per reconstructed case study** (`<ntsb-number>.sqlite`), containing the
+  case record, utterances, events, joins, report versions, chat history, and audit log.
+  FTS5 for transcript and report search. Digests and ad-hoc reconstructions live in a
+  workspace database (`workspace.sqlite`) until promoted to a case.
+- Raw ADS-B points are **not** stored in the case database; they stay in the local Parquet
+  cache and the case database references them by hash. This keeps the case file free of
+  licensed point data so it can be archived or audited without redistributing ADS-B.
 - Raw downloads in a content-addressed cache keyed by SHA-256; the database stores hashes,
   URLs, fetch time, and provider, so every derived artifact can be traced to bytes.
 
@@ -213,18 +221,25 @@ latc case build --ntsb ERA24LA123       # or --registration N123AB --date 2024-0
 ```
 1. Fetch the NTSB record (CAROL → fallback monthly DB); determine event UTC window,
    location, registration, aircraft type, nearest airports, report status.
-2. Fetch docket documents; detect official ATC transcripts/audio and ingest them as the
-   primary transcript source.
+2. Fetch docket documents and select the audio/transcript source in this fixed priority:
+   1. **NTSB audio** from the docket (transcribed by our ASR, timestamps aligned to the
+      NTSB transcript when one exists).
+   2. **NTSB transcript** from the docket (text only; the report notes that audio itself is
+      not available).
+   3. **LiveATC audio captured by watch mode** (§5.4) while the archive was still live.
+   4. None of the above: the report states **"Audio not available for the accident in
+      question"** and the reconstruction proceeds on ADS-B and NTSB narrative alone.
 3. Resolve ADS-B hex from registration (FAA registry) and fetch traces for the window.
-4. If within the LiveATC retention window, fetch LiveATC blocks for airports along the track;
-   otherwise record "LiveATC audio unavailable (retention expired)" as a data gap.
+4. If the event is still inside the LiveATC retention window and no NTSB audio exists,
+   fetch LiveATC blocks for airports along the track now and tag them to the case.
 5. Build reconstruction (§5.2) and the report (§7.3); validate; save with full provenance.
 
-### 5.4 Watch mode (closes the 30-day gap)
+### 5.4 Watch mode (fallback for the 30-day gap)
 A scheduled job polls NTSB preliminary reports and FAA ASIAS daily, and for each new event
 immediately archives the relevant LiveATC blocks and live ADS-B history into the local
 cache, tagged by event, so a case study can be built months later when the final report
-arrives. This is the only reliable way to have LiveATC audio for most NTSB cases.
+arrives. Watch mode is a **fallback**: NTSB docket audio always takes priority when it
+exists, and when neither exists the case reports that audio is not available.
 
 ---
 
@@ -310,6 +325,8 @@ audit_log          id, utc, actor, action, target, details_json
 ```
 
 `report_version` rows are append-only; a regenerated report creates a new version.
+`track.parquet_path` points at the local cache; case databases carry `track_event` rows and
+rendered figures, not raw positions (see §3.3 and §4.8).
 
 ---
 
@@ -342,7 +359,7 @@ own caching, retries, and timestamp handling.
 |---|---|---|
 | Engine language | Python 3.11+ | Existing code; Whisper, pydub, GeoPandas/Shapely, DuckDB/Parquet ecosystem. |
 | Local ASR | faster-whisper + ATC fine-tune | 4× faster than openai-whisper on CPU, word timestamps, same checkpoints via CT2 conversion. |
-| LLM layer | provider-agnostic (`litellm`-style thin wrapper) | OpenAI today; Anthropic/local tomorrow without pipeline changes. |
+| LLM layer | provider-agnostic (`litellm`-style thin wrapper) | OpenAI is the v0 default; other cloud providers are adapters. A local LLM is **not** required for v0. |
 | Track storage | Parquet + DuckDB | adsb.lol days are large; columnar scans by hex/time are cheap. |
 | Database | SQLite + FTS5 | Zero-config, single file, portable, auditable. |
 | Desktop shell | Tauri 2 | Small binaries, native webview, first-class sidecar support. |
@@ -352,25 +369,34 @@ own caching, retries, and timestamp handling.
 
 ---
 
-## 11. Open questions for the workshop
+## 11. Open questions (still open)
 
-1. **LiveATC retention.** Given ~30-day archives, is the "watch mode" (§5.4) acceptable as
-   the primary way to obtain audio for NTSB cases, with NTSB docket transcripts as the
-   fallback? Or should historical cases simply report "audio unavailable"?
-2. **"Translate".** Confirm this means transcription + phraseology normalization. Is
-   translation into other languages a requirement for v1?
-3. **LLM provider.** The current prototype is OpenAI-only. Should v1 be provider-agnostic
-   from the start, and is a fully local (Ollama) path required for minimum functionality?
-4. **Desktop first or CLI first.** The proposal is CLI first (Phases 1–4) with the desktop
-   app in Phase 5, because the engine and safeguards are the hard part and the GUI is a
-   thin layer. Agree?
-5. **ADS-B default.** adsb.lol history is the only free source for arbitrary dates. Its
-   ODbL share-alike terms affect anyone who redistributes exported reconstructions. OK?
-6. **Scope of the educational corpus.** Start with 14 CFR Parts 1, 61, 91, 97, 121, 135;
-   AIM; PHAK; AFH; IFH; IPH; ACs 61-series and 90-series; ADs by make/model. Anything else?
-7. **Target platforms.** macOS + Windows + Linux for the desktop app? Signing/notarization
-   budget?
-8. **Local-model hardware floor.** What is the slowest machine we care about for local
-   Whisper (CPU-only laptop vs. GPU)? This decides the default checkpoint size.
-9. **Database location.** One SQLite file per workspace in the user's documents folder, or
-   one global database?
+1. **Transcript-only cases.** When the NTSB docket has a transcript but no audio, the
+   report will say "audio not available" and use the transcript as the text source. Confirm
+   that a transcript-only case is acceptable for full reconstruction, or whether it should
+   be labelled differently (e.g. "reconstruction from NTSB transcript").
+2. **Rendered maps as exports.** Under the no-export rule, exports contain map figures that
+   depict the track but no point data. Is a rendered image acceptable, or should exports
+   omit track imagery entirely?
+3. **Digest storage.** Cases get one SQLite file each. Should digests and ad-hoc
+   reconstructions share one `workspace.sqlite` (proposed), or also get one file each?
+4. **Educational corpus scope.** Proposed start: 14 CFR Parts 1, 61, 91, 97, 121, 135;
+   AIM; PHAK; AFH; IFH; IPH; ACs 61-series and 90-series; ADs by make/model. Anything to add
+   or drop?
+5. **Desktop platforms.** macOS + Windows + Linux? Is code signing / notarization in budget
+   for the first GUI release?
+6. **Local ASR hardware floor.** Slowest supported machine for local Whisper (CPU-only
+   laptop vs. GPU)? This sets the default checkpoint size; cloud ASR remains the fallback.
+7. **Watch-mode polling.** Daily polling of NTSB preliminary reports and FAA ASIAS: run as a
+   background service installed by the app, or only while the app/CLI is running?
+
+## 12. Decisions log
+
+| # | Decision | Date |
+|---|---|---|
+| D1 | Audio source priority for cases: NTSB docket audio → NTSB docket transcript → LiveATC audio captured by watch mode → "Audio not available for the accident in question". Watch mode is a fallback only. | 2026-10-15 |
+| D2 | CLI first; the desktop app is a thin layer over the same engine. | 2026-10-15 |
+| D3 | "Translate" = transcription to English + phraseology normalization. No foreign-language translation. | 2026-10-15 |
+| D4 | LLM layer is provider-agnostic; OpenAI is the v0 default; no local LLM requirement for v0. | 2026-10-15 |
+| D5 | One SQLite database per reconstructed case study. | 2026-10-15 |
+| D6 | Retrieved ADS-B data is never exported, to stay within free-licence terms (ODbL, ADS-B Exchange). Raw points stay in the local cache, outside the case database. | 2026-10-15 |
