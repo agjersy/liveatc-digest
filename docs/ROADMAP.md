@@ -3,11 +3,12 @@
 Phases are ordered so that each one ships something usable from the CLI, and so the
 safety safeguards exist before any accident-related output is produced.
 
-## Phase 0 — Foundation
+## Phase 0 — Foundation  ✅ (shipped 2026-10-15)
 - Restructure into `engine/` package with `pyproject.toml`, console script `latc`.
 - Fold `liveatc_downloader` into the package; add caching, retries, UTC block planning.
 - Config file + OS keychain for API keys. SQLite store with migrations. Audit log.
-- Test fixtures: a 2-minute public-domain ATC clip, one readsb trace file, a CIFP excerpt.
+- Test fixtures: LiveATC HTML pages (done); audio clip, readsb trace, CIFP excerpt arrive
+  with the phases that need them.
 
 **Done when:** `latc stations KBED` and `latc fetch kbed_twr --from … --to …` work with cache hits.
 
