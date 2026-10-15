@@ -3,6 +3,7 @@ import json
 from typer.testing import CliRunner
 
 from liveatc_digest.cli import main as cli
+from liveatc_digest.engine import Engine
 from liveatc_digest.http import HttpClient
 from tests.conftest import FakeResponse
 
@@ -12,7 +13,7 @@ MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\x00" * 100
 
 def _wire(monkeypatch, session):
     monkeypatch.setattr(
-        cli.Ctx,
+        Engine,
         "client",
         property(lambda self: HttpClient("t", session=session, sleep=lambda s: None)),
     )
@@ -68,4 +69,46 @@ def test_config_show_and_set(home):
 def test_db_info(home):
     result = runner.invoke(cli.app, ["--json", "db", "info"])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["schema"] == "001_initial.sql"
+    assert json.loads(result.stdout)["schema"] == "002_phase1.sql"
+
+
+def test_transcribe_and_digest_commands(home, session, search_html, archive_html, monkeypatch):
+    from liveatc_digest import engine as engine_mod
+    from tests.audio_fixtures import write_bursts
+    from tests.test_engine import URL, FakeAsr, FakeLlm, _FrozenDatetime
+
+    _wire(monkeypatch, session)
+    monkeypatch.setattr("liveatc_digest.sources.liveatc.archive.datetime", _FrozenDatetime)
+    monkeypatch.setattr(engine_mod, "make_provider", lambda *_a, **_k: FakeAsr())
+    monkeypatch.setattr(engine_mod, "make_llm", lambda *_a, **_k: FakeLlm())
+    session.add(
+        "https://www.liveatc.net/search/?icao=kbed", FakeResponse(200, search_html.encode())
+    )
+    session.add(
+        "https://www.liveatc.net/archive.php?m=kbed_twr", FakeResponse(200, archive_html.encode())
+    )
+    home.mkdir(parents=True, exist_ok=True)
+    wav = write_bursts(home / "block.wav", [(1.0, 2.5), (4.0, 5.0)], total_s=6.0)
+    session.add(URL, FakeResponse(200, wav.read_bytes(), "audio/mpeg"))
+    window = ["--from", "2024-07-28T00:00Z", "--to", "2024-07-28T00:30Z"]
+
+    result = runner.invoke(cli.app, ["--json", "transcribe", "kbed_twr", *window])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)[0]["utterances"] == 2
+
+    result = runner.invoke(cli.app, ["--json", "transcript", "KBED", *window])
+    rows = json.loads(result.stdout)
+    assert [r["callsigns"] for r in rows] == [["N123AB"], []]
+
+    out = home / "digest.md"
+    result = runner.invoke(cli.app, ["--json", "digest", "KBED", *window, "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["version"] == 1 and data["llm_provider"] == "fake-llm"
+    assert [r["reason"] for r in data["validator_removed"]] == ["no citation"]
+    assert out.read_text().startswith("# ATC digest — KBED")
+
+    result = runner.invoke(cli.app, ["--json", "report", "list"])
+    assert json.loads(result.stdout)[0]["kind"] == "digest"
+    result = runner.invoke(cli.app, ["report", "show", "1"])
+    assert "## Chronology" in result.stdout

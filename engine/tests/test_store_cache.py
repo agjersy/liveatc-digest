@@ -5,7 +5,7 @@ from liveatc_digest.store import Store
 def test_migrations_are_idempotent(tmp_path):
     path = tmp_path / "db.sqlite"
     s1 = Store(path)
-    assert s1.schema_version() == "001_initial.sql"
+    assert s1.schema_version() == "002_phase1.sql"
     s1.close()
     s2 = Store(path)
     assert s2.migrate() == []

@@ -1,4 +1,4 @@
-"""`latc` command-line interface."""
+"""`latc` command-line interface (thin layer over :class:`liveatc_digest.engine.Engine`)."""
 
 from __future__ import annotations
 
@@ -13,10 +13,9 @@ from rich.console import Console
 from rich.table import Table
 
 from .. import __version__, config, paths
-from ..cache import Cache
-from ..http import HttpClient, HttpError
+from ..engine import Engine, iso
+from ..http import HttpError
 from ..sources import liveatc
-from ..store import Store
 
 app = typer.Typer(
     name="latc",
@@ -26,9 +25,11 @@ app = typer.Typer(
 config_app = typer.Typer(help="View and edit settings and API keys.", no_args_is_help=True)
 db_app = typer.Typer(help="Workspace database.", no_args_is_help=True)
 cache_app = typer.Typer(help="Raw download cache.", no_args_is_help=True)
+report_app = typer.Typer(help="Saved digests and reports.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(db_app, name="db")
 app.add_typer(cache_app, name="cache")
+app.add_typer(report_app, name="report")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -38,30 +39,11 @@ class Ctx:
     def __init__(self, settings: config.Settings, as_json: bool) -> None:
         self.settings = settings
         self.json = as_json
-        self._store: Store | None = None
-        self._cache: Cache | None = None
-        self._client: HttpClient | None = None
+        self.engine = Engine(settings, progress=self._progress)
 
-    @property
-    def store(self) -> Store:
-        if self._store is None:
-            self._store = Store(self.settings.workspace_db)
-        return self._store
-
-    @property
-    def cache(self) -> Cache:
-        if self._cache is None:
-            self._cache = Cache(self.settings.cache_dir)
-        return self._cache
-
-    @property
-    def client(self) -> HttpClient:
-        if self._client is None:
-            self._client = HttpClient(
-                self.settings.liveatc.user_agent,
-                timeout_s=self.settings.liveatc.request_timeout_s,
-            )
-        return self._client
+    def _progress(self, msg: str) -> None:
+        if not self.json:
+            err_console.print(f"[dim]{msg}[/dim]", markup=True, highlight=False)
 
 
 def _emit(ctx: Ctx, payload: Any, render) -> None:
@@ -73,13 +55,18 @@ def _emit(ctx: Ctx, payload: Any, render) -> None:
 
 def parse_utc(value: str) -> datetime:
     text = value.strip()
-    if text.endswith("Z") or text.endswith("z"):
+    if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(text)
     except ValueError as exc:
         raise typer.BadParameter(f"not an ISO-8601 timestamp: {value}") from exc
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+FromOpt = Annotated[str, typer.Option("--from", help="Start UTC, e.g. 2024-07-28T00:00Z")]
+ToOpt = Annotated[str, typer.Option("--to", help="End UTC (exclusive)")]
+IcaoOpt = Annotated[str | None, typer.Option(help="Airport ICAO (default: from the mount)")]
 
 
 @app.callback()
@@ -99,7 +86,7 @@ def version() -> None:
     console.print(__version__)
 
 
-# -- stations ---------------------------------------------------------------------------
+# -- stations / fetch -------------------------------------------------------------------
 
 
 @app.command()
@@ -108,13 +95,7 @@ def stations(
 ) -> None:
     """List LiveATC feeds for an airport and remember them in the workspace database."""
     c: Ctx = ctx.obj
-    found = liveatc.fetch_stations(c.client, icao)
-    for st in found:
-        c.store.upsert_station(
-            st.icao, st.identifier, st.title, st.role, st.up, [f.as_dict() for f in st.frequencies]
-        )
-    c.store.audit("stations.list", icao.upper(), count=len(found))
-
+    found = c.engine.stations(icao)
     payload = [
         {
             "icao": st.icao,
@@ -132,11 +113,8 @@ def stations(
             console.print(f"No feeds found for {icao.upper()}.")
             return
         table = Table(title=f"LiveATC feeds for {icao.upper()}")
-        table.add_column("Mount")
-        table.add_column("Role")
-        table.add_column("Title")
-        table.add_column("Status")
-        table.add_column("Frequencies")
+        for col in ("Mount", "Role", "Title", "Status", "Frequencies"):
+            table.add_column(col)
         for st in found:
             table.add_row(
                 st.identifier,
@@ -150,82 +128,27 @@ def stations(
     _emit(c, payload, render)
 
 
-# -- fetch ------------------------------------------------------------------------------
-
-
 @app.command()
 def fetch(
     ctx: typer.Context,
     station: Annotated[str, typer.Argument(help="LiveATC mount, e.g. kbed_twr")],
-    start: Annotated[str, typer.Option("--from", help="Start UTC, e.g. 2024-07-28T00:00Z")],
-    end: Annotated[str, typer.Option("--to", help="End UTC (exclusive)")],
-    icao: Annotated[str | None, typer.Option(help="Airport ICAO (default: from the mount)")] = None,
+    start: FromOpt,
+    end: ToOpt,
+    icao: IcaoOpt = None,
 ) -> None:
     """Download the 30-minute archive blocks covering a UTC window into the cache."""
     c: Ctx = ctx.obj
-    start_dt, end_dt = parse_utc(start), parse_utc(end)
-    airport = (icao or station.split("_")[0]).upper()
-
-    row = c.store.get_station(station)
-    archive_id = row["archive_id"] if row else None
-    if row is None:
-        for st in liveatc.fetch_stations(c.client, airport):
-            c.store.upsert_station(
-                st.icao,
-                st.identifier,
-                st.title,
-                st.role,
-                st.up,
-                [f.as_dict() for f in st.frequencies],
-            )
-        row = c.store.get_station(station)
-        if row is None:
-            err_console.print(f"[red]Unknown station {station!r} for {airport}.[/red]")
-            raise typer.Exit(code=2)
-    if not archive_id:
-        archive_id = liveatc.resolve_archive_id(c.client, station)
-        c.store.set_station_archive_id(station, archive_id)
-
-    blocks = liveatc.plan_blocks(start_dt, end_dt)
-    retention = c.settings.liveatc.retention_days
-    results: list[dict[str, Any]] = []
-    for block in blocks:
-        start_iso = block.start_utc.isoformat().replace("+00:00", "Z")
-        end_iso = block.end_utc.isoformat().replace("+00:00", "Z")
-        try:
-            fetched = liveatc.fetch_block(
-                c.client, c.cache, c.store, airport, archive_id, block, retention_days=retention
-            )
-        except liveatc.ArchiveNotAvailable as exc:
-            status = str(liveatc.block_status(block, retention_days=retention))
-            if status == "available":
-                status = "missing"
-            c.store.upsert_audio_block(row["id"], airport, start_iso, end_iso, status)
-            results.append(
-                {"start_utc": start_iso, "status": status, "reason": exc.reason, "url": exc.url}
-            )
-            continue
-        rec = c.store.find_fetch(fetched.url, liveatc.archive.PROVIDER)
-        c.store.upsert_audio_block(
-            row["id"], airport, start_iso, end_iso, "fetched", rec.id if rec else None
-        )
-        results.append(
-            {
-                "start_utc": start_iso,
-                "status": "fetched",
-                "cached": fetched.cached,
-                "sha256": fetched.sha256,
-                "path": str(fetched.path),
-                "url": fetched.url,
-            }
-        )
-    c.store.audit("fetch.blocks", station, start=start, end=end, count=len(results))
+    try:
+        outcomes = c.engine.fetch(station, parse_utc(start), parse_utc(end), icao)
+    except LookupError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from None
+    results = [o.as_dict() for o in outcomes]
 
     def render() -> None:
-        table = Table(title=f"{station} ({archive_id}) {start} → {end}")
-        table.add_column("Block start (UTC)")
-        table.add_column("Status")
-        table.add_column("Detail")
+        table = Table(title=f"{station} {start} → {end}")
+        for col in ("Block start (UTC)", "Status", "Detail"):
+            table.add_column(col)
         for r in results:
             detail = r.get("path") or r.get("reason", "")
             if r.get("cached"):
@@ -236,6 +159,209 @@ def fetch(
     _emit(c, results, render)
     if all(r["status"] != "fetched" for r in results):
         raise typer.Exit(code=1)
+
+
+# -- transcribe / transcript / digest ---------------------------------------------------
+
+
+@app.command()
+def transcribe(
+    ctx: typer.Context,
+    station: Annotated[str, typer.Argument(help="LiveATC mount, e.g. kbed_twr")],
+    start: FromOpt,
+    end: ToOpt,
+    icao: IcaoOpt = None,
+    asr: Annotated[
+        str | None, typer.Option(help="openai | local-whisper (default: settings)")
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option(help="ASR model name (default: provider default)")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-transcribe blocks that already have utterances")
+    ] = False,
+) -> None:
+    """Fetch (if needed), segment, and transcribe a window into UTC-stamped utterances."""
+    c: Ctx = ctx.obj
+    try:
+        outcomes = c.engine.transcribe(
+            station, parse_utc(start), parse_utc(end), icao, asr, model, force
+        )
+    except LookupError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from None
+    results = [o.as_dict() for o in outcomes]
+
+    def render() -> None:
+        table = Table(title=f"Transcribed {station} {start} → {end}")
+        for col in ("Block start (UTC)", "Status", "Utterances", "Note"):
+            table.add_column(col)
+        for r in results:
+            note = "already transcribed" if r.get("skipped") else r.get("reason", "")
+            table.add_row(r["start_utc"], r["status"], str(r["utterances"]), note)
+        console.print(table)
+
+    _emit(c, results, render)
+    if all(r["status"] != "fetched" for r in results):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def transcript(
+    ctx: typer.Context,
+    icao: Annotated[str, typer.Argument(help="Airport ICAO")],
+    start: FromOpt,
+    end: ToOpt,
+    feeds: Annotated[str | None, typer.Option(help="Comma-separated mounts (default: all)")] = None,
+) -> None:
+    """Print stored utterances for a window."""
+    c: Ctx = ctx.obj
+    stations_list = [s.strip() for s in feeds.split(",")] if feeds else None
+    views = c.engine.utterance_views(icao, parse_utc(start), parse_utc(end), stations_list)
+    payload = [
+        {
+            "id": v.id,
+            "start_utc": iso(v.start_utc),
+            "end_utc": iso(v.end_utc),
+            "feed": v.feed,
+            "phase": v.phase,
+            "confidence": v.confidence,
+            "text": v.text,
+            "normalized": v.normalized_text,
+            "callsigns": v.callsigns,
+            "events": v.events,
+        }
+        for v in views
+    ]
+
+    def render() -> None:
+        if not views:
+            console.print("No utterances stored for that window. Run `latc transcribe` first.")
+            return
+        for v in views:
+            conf = "" if v.confidence is None else f" ({v.confidence:.2f})"
+            who = ", ".join(v.callsigns) if v.callsigns else "-"
+            console.print(
+                f"[u{v.id}] {v.start_utc:%H:%M:%S}Z {v.feed} {v.phase} {who}{conf}: {v.text}",
+                markup=False,
+                highlight=False,
+            )
+
+    _emit(c, payload, render)
+
+
+@app.command()
+def digest(
+    ctx: typer.Context,
+    icao: Annotated[str, typer.Argument(help="Airport ICAO")],
+    start: FromOpt,
+    end: ToOpt,
+    feeds: Annotated[str | None, typer.Option(help="Comma-separated mounts (default: all)")] = None,
+    llm: Annotated[
+        bool, typer.Option("--llm/--no-llm", help="Add an LLM narrative (validated for grounding)")
+    ] = True,
+    llm_provider: Annotated[
+        str | None, typer.Option(help="openai | anthropic (default: settings)")
+    ] = None,
+    llm_model: Annotated[str | None, typer.Option(help="LLM model (default: settings)")] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="Write Markdown to this file")] = None,
+) -> None:
+    """Build a cited digest of stored utterances and save it as a report version."""
+    c: Ctx = ctx.obj
+    stations_list = [s.strip() for s in feeds.split(",")] if feeds else None
+    saved = c.engine.digest(
+        icao, parse_utc(start), parse_utc(end), stations_list, llm, llm_provider, llm_model
+    )
+    if saved.utterance_count == 0:
+        err_console.print("[red]No utterances in that window; run `latc transcribe` first.[/red]")
+        raise typer.Exit(code=1)
+    if out:
+        out.write_text(saved.result.markdown, encoding="utf-8")
+    removed = saved.result.validation.removed if saved.result.validation else []
+    payload = {
+        "reconstruction_id": saved.reconstruction_id,
+        "version": saved.version,
+        "utterances": saved.utterance_count,
+        "llm_provider": saved.result.llm_provider,
+        "llm_model": saved.result.llm_model,
+        "validator_removed": removed,
+        "markdown": saved.result.markdown,
+    }
+
+    def render() -> None:
+        if not out:
+            console.print(saved.result.markdown, markup=False, highlight=False)
+        err_console.print(
+            f"[dim]Saved as reconstruction {saved.reconstruction_id} v{saved.version}"
+            + (f"; validator removed {len(removed)} sentence(s)" if removed else "")
+            + (f"; wrote {out}" if out else "")
+            + "[/dim]"
+        )
+
+    _emit(c, payload, render)
+
+
+@app.command()
+def reextract(
+    ctx: typer.Context,
+    icao: Annotated[str, typer.Argument(help="Airport ICAO")],
+    start: FromOpt,
+    end: ToOpt,
+) -> None:
+    """Re-run callsign/event extraction and phase classification over stored utterances."""
+    c: Ctx = ctx.obj
+    n = c.engine.reextract(icao, parse_utc(start), parse_utc(end))
+    console.print(f"Re-extracted {n} utterances.")
+
+
+# -- reports ----------------------------------------------------------------------------
+
+
+@report_app.command("list")
+def report_list(ctx: typer.Context, limit: int = 20) -> None:
+    """List saved reconstructions and how many versions each has."""
+    c: Ctx = ctx.obj
+    rows = [dict(r) for r in c.engine.store.list_reports(limit)]
+
+    def render() -> None:
+        table = Table(title="Reports")
+        for col in ("ID", "Kind", "ICAO", "Window", "Versions", "Created"):
+            table.add_column(col)
+        for r in rows:
+            table.add_row(
+                str(r["reconstruction_id"]),
+                r["kind"],
+                r["icao"] or "",
+                f"{r['start_utc']} → {r['end_utc']}",
+                str(r["versions"] or 0),
+                r["created_at"],
+            )
+        console.print(table)
+
+    _emit(c, rows, render)
+
+
+@report_app.command("show")
+def report_show(
+    ctx: typer.Context,
+    reconstruction_id: int,
+    version: Annotated[int | None, typer.Option(help="Version (default: latest)")] = None,
+    evidence: Annotated[
+        bool, typer.Option("--evidence", help="Print the evidence map instead of the body")
+    ] = False,
+) -> None:
+    """Print a saved report version."""
+    c: Ctx = ctx.obj
+    row = c.engine.store.get_report(reconstruction_id, version)
+    if row is None:
+        err_console.print("[red]No such report.[/red]")
+        raise typer.Exit(code=2)
+    if evidence:
+        console.print_json(row["evidence_map_json"])
+    elif c.json:
+        console.print_json(json.dumps({k: row[k] for k in row.keys()}))
+    else:
+        console.print(row["body_md"], markup=False, highlight=False)
 
 
 # -- config -----------------------------------------------------------------------------
@@ -300,9 +426,8 @@ def config_set_key(
 def config_keys() -> None:
     """Show which API keys are available (values are never printed)."""
     table = Table(title="API keys")
-    table.add_column("Provider")
-    table.add_column("Env var")
-    table.add_column("Available")
+    for col in ("Provider", "Env var", "Available"):
+        table.add_column(col)
     for provider, env_var in config.KEY_ENV_VARS.items():
         table.add_row(provider, env_var, "yes" if config.get_api_key(provider) else "no")
     console.print(table)
@@ -315,7 +440,7 @@ def config_keys() -> None:
 def db_init(ctx: typer.Context) -> None:
     """Create or migrate the workspace database."""
     c: Ctx = ctx.obj
-    store = c.store
+    store = c.engine.store
     console.print(f"{store.path}  schema={store.schema_version()}")
 
 
@@ -323,11 +448,12 @@ def db_init(ctx: typer.Context) -> None:
 def db_info(ctx: typer.Context) -> None:
     """Row counts per table."""
     c: Ctx = ctx.obj
-    counts = c.store.counts()
-    payload = {"path": str(c.store.path), "schema": c.store.schema_version(), "counts": counts}
+    store = c.engine.store
+    counts = store.counts()
+    payload = {"path": str(store.path), "schema": store.schema_version(), "counts": counts}
 
     def render() -> None:
-        table = Table(title=str(c.store.path))
+        table = Table(title=str(store.path))
         table.add_column("Table")
         table.add_column("Rows", justify="right")
         for name, n in counts.items():
@@ -341,10 +467,12 @@ def db_info(ctx: typer.Context) -> None:
 def cache_info(ctx: typer.Context) -> None:
     """Object count and size of the raw download cache."""
     c: Ctx = ctx.obj
-    count, total = c.cache.stats()
-    payload = {"path": str(c.cache.root), "objects": count, "bytes": total}
+    count, total = c.engine.cache.stats()
+    payload = {"path": str(c.engine.cache.root), "objects": count, "bytes": total}
     _emit(
-        c, payload, lambda: console.print(f"{c.cache.root}: {count} objects, {total / 1e6:.1f} MB")
+        c,
+        payload,
+        lambda: console.print(f"{c.engine.cache.root}: {count} objects, {total / 1e6:.1f} MB"),
     )
 
 
@@ -357,8 +485,8 @@ def cache_prune(
 ) -> None:
     """Delete cached objects not accessed recently."""
     c: Ctx = ctx.obj
-    removed = c.cache.prune(older_than_days * 86400)
-    c.store.audit("cache.prune", None, removed=removed, older_than_days=older_than_days)
+    removed = c.engine.cache.prune(older_than_days * 86400)
+    c.engine.store.audit("cache.prune", None, removed=removed, older_than_days=older_than_days)
     console.print(f"Removed {removed} objects.")
 
 

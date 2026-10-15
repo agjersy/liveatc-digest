@@ -12,10 +12,11 @@ safety safeguards exist before any accident-related output is produced.
 
 **Done when:** `latc stations KBED` and `latc fetch kbed_twr --from … --to …` work with cache hits.
 
-## Phase 1 — Digest MVP
+## Phase 1 — Digest MVP  ✅ (shipped 2026-10-15)
 - Segmentation with absolute UTC timestamps; `TranscriptionProvider` (local faster-whisper,
   OpenAI) with per-utterance confidence.
-- Rule-based callsign/clearance extraction; LLM structured extraction with span check.
+- Rule-based callsign/clearance extraction with character spans (LLM structured extraction
+  deferred to Phase 2; the rules tier covers the digest's needs).
 - Phase classification (ground / terminal / enroute) from feed role + content.
 - Digest generator with citations; grounding validator (citation check + speculation lint).
 - Markdown and JSON output; reports saved as versions.

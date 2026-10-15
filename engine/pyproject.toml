@@ -18,11 +18,13 @@ dependencies = [
   "platformdirs>=4.2",
   "keyring>=25.2",
   "tomli-w>=1.0",
+  "pydub>=0.25",
+  "audioop-lts>=0.2; python_version >= '3.13'",
 ]
 
 [project.optional-dependencies]
-audio = ["pydub>=0.25"]
-asr-openai = ["openai>=1.37"]
+openai = ["openai>=1.37"]
+anthropic = ["anthropic>=0.30"]
 asr-local = ["faster-whisper>=1.0"]
 dev = ["pytest>=8.2", "ruff>=0.5", "pytest-cov>=5.0"]
 
@@ -38,6 +40,9 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"liveatc_digest/nlp/events.py" = ["E501"]   # pattern table reads best one rule per line
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
