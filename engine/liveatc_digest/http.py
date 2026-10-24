@@ -53,6 +53,31 @@ class DownloadResult:
     size: int
 
 
+@dataclass
+class ProbeResult:
+    """What a server answered, for `latc diagnose`: enough to tell a challenge from a refusal."""
+
+    url: str
+    status: int
+    headers: dict[str, str]
+    body_snippet: str
+    challenge: bool
+
+    INTERESTING = (
+        "server", "content-type", "content-length", "cf-mitigated", "cf-ray", "location",
+        "www-authenticate", "x-frame-options", "set-cookie", "date",
+    )  # fmt: skip
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "url": self.url,
+            "status": self.status,
+            "challenge": self.challenge,
+            "headers": {k: v for k, v in self.headers.items() if k.lower() in self.INTERESTING},
+            "body_snippet": self.body_snippet,
+        }
+
+
 class HttpClient:
     def __init__(
         self,
@@ -86,6 +111,29 @@ class HttpClient:
                 self._sleep(self.backoff_s * (2**attempt))
         raise HttpError(url, None, f"request failed after retries: {last_exc}")
 
+    def probe(self, url: str, snippet_chars: int = 600) -> ProbeResult:
+        """GET *url* without raising; returns status, headers and the start of the body."""
+        resp = self._request("GET", url, stream=True)
+        raw = b""
+        for chunk in resp.iter_content(chunk_size=4096):
+            raw += chunk
+            if len(raw) >= 4096:
+                break
+        text = raw.decode("utf-8", "replace")
+        ctype = resp.headers.get("Content-Type", "")
+        snippet = (
+            text[:snippet_chars]
+            if "text" in ctype or "json" in ctype or "xml" in ctype
+            else (f"<{len(raw)}+ bytes of {ctype or 'binary'}>")
+        )
+        return ProbeResult(
+            url,
+            resp.status_code,
+            dict(resp.headers),
+            snippet,
+            looks_like_challenge(resp.status_code, resp.headers, text),
+        )
+
     def get_text(self, url: str) -> str:
         resp = self._request("GET", url)
         if looks_like_challenge(resp.status_code, resp.headers, resp.text):
@@ -97,7 +145,12 @@ class HttpClient:
     def download(self, url: str, dest: Path, chunk_size: int = 1 << 16) -> DownloadResult:
         resp = self._request("GET", url, stream=True)
         if resp.status_code != 200:
-            if looks_like_challenge(resp.status_code, resp.headers, ""):
+            snippet = ""
+            try:
+                snippet = next(resp.iter_content(chunk_size=4096), b"").decode("utf-8", "replace")
+            except Exception:  # body unreadable; status alone has to do
+                pass
+            if looks_like_challenge(resp.status_code, resp.headers, snippet):
                 raise ChallengeError(url, resp.status_code)
             raise HttpError(url, resp.status_code)
         dest.parent.mkdir(parents=True, exist_ok=True)

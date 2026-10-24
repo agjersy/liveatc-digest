@@ -16,7 +16,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from ...cache import Cache
-from ...http import HttpClient, HttpError
+from ...http import ChallengeError, HttpClient, HttpError
 from ...store import Store
 
 PROVIDER = "liveatc"
@@ -104,6 +104,21 @@ def block_status(
 
 
 _ARCHIVE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]*$")
+_FILENAME_RE = re.compile(
+    r"^(?P<archive_id>[A-Za-z0-9][A-Za-z0-9\-]*?)-"
+    r"(?P<mon>[A-Z][a-z]{2})-(?P<day>\d{2})-(?P<year>\d{4})-(?P<hm>\d{4})Z\.mp3$"
+)
+
+
+def parse_archive_filename(name: str) -> tuple[str, Block]:
+    """``KBED-Twr-Oct-24-2026-0000Z.mp3`` -> (``KBED-Twr``, Block(2026-10-24T00:00Z))."""
+    m = _FILENAME_RE.match(Path(name).name)
+    if not m:
+        raise ValueError(f"not a LiveATC archive filename: {name!r}")
+    start = datetime.strptime(
+        f"{m['mon']}-{m['day']}-{m['year']}-{m['hm']}", "%b-%d-%Y-%H%M"
+    ).replace(tzinfo=UTC)
+    return m["archive_id"], Block(start)
 
 
 def parse_archive_id(html: str) -> str:
@@ -158,8 +173,22 @@ def fetch_block(
     tmp = cache.temp_path(".mp3")
     try:
         result = client.download(url, tmp)
+    except ChallengeError as exc:
+        raise ArchiveNotAvailable(
+            url,
+            "the archive host answered with a human-verification page; download the file in "
+            "your browser and use `latc import`",
+        ) from exc
     except HttpError as exc:
-        reason = f"HTTP {exc.status}" if exc.status is not None else f"network error: {exc}"
+        if exc.status == 403:
+            reason = (
+                "HTTP 403 (refused by the archive host; run `latc diagnose <url>` to see why, "
+                "or download it in your browser and use `latc import`)"
+            )
+        elif exc.status is not None:
+            reason = f"HTTP {exc.status}"
+        else:
+            reason = f"network error: {exc}"
         raise ArchiveNotAvailable(url, reason) from exc
     if result.size == 0 or not _looks_like_mp3(tmp, result.content_type):
         tmp.unlink(missing_ok=True)
@@ -168,3 +197,33 @@ def fetch_block(
     obj = cache.put_file(tmp)
     store.record_fetch(PROVIDER, url, obj.sha256, obj.size, result.content_type, LICENCE)
     return FetchedBlock(block, obj.path, obj.sha256, url, False)
+
+
+def import_block(
+    cache: Cache,
+    store: Store,
+    icao: str,
+    archive_id: str,
+    block: Block,
+    source_path: Path,
+) -> FetchedBlock:
+    """Register a recording the person downloaded themselves as if it had been fetched.
+
+    The file is copied into the cache and recorded against the archive URL it corresponds to,
+    so later ``fetch_block`` calls are cache hits and never touch the network.
+    """
+    url = archive_url(icao, archive_id, block)
+    if not source_path.exists() or source_path.stat().st_size == 0:
+        raise ArchiveNotAvailable(url, f"file missing or empty: {source_path}")
+    if not _looks_like_mp3(source_path, ""):
+        raise ArchiveNotAvailable(url, f"not an MP3 file: {source_path}")
+    obj = cache.put_file(source_path, move=False)
+    store.record_fetch(
+        PROVIDER,
+        url,
+        obj.sha256,
+        obj.size,
+        "audio/mpeg",
+        LICENCE + " Imported from a file the user downloaded in their browser.",
+    )
+    return FetchedBlock(block, obj.path, obj.sha256, url, True)

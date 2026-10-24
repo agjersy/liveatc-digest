@@ -181,6 +181,58 @@ def fetch(
         raise typer.Exit(code=1)
 
 
+@app.command("import")
+def import_cmd(
+    ctx: typer.Context,
+    path: Annotated[Path, typer.Argument(help="MP3 you downloaded from LiveATC's archive page")],
+    station: Annotated[str, typer.Option("--station", help="LiveATC mount, e.g. kbed_twr")],
+    icao: IcaoOpt = None,
+    archive_id: ArchiveIdOpt = None,
+    start: Annotated[
+        str | None, typer.Option("--start", help="Block start UTC if the filename was changed")
+    ] = None,
+) -> None:
+    """Register a recording you downloaded yourself; transcribe/digest then need no network."""
+    c: Ctx = ctx.obj
+    try:
+        outcome = c.engine.import_recording(
+            path, station, icao, archive_id, parse_utc(start) if start else None
+        )
+    except (ValueError, LookupError, liveatc.ArchiveNotAvailable) as exc:
+        err_console.print(str(exc), style="red", markup=False, highlight=False)
+        raise typer.Exit(code=2) from None
+    payload = outcome.as_dict()
+    _emit(
+        c,
+        payload,
+        lambda: console.print(
+            f"Imported {path.name} as {station} block {payload['start_utc']} "
+            f"(sha256 {outcome.sha256[:12]}…)."
+        ),
+    )
+
+
+@app.command()
+def diagnose(ctx: typer.Context, url: Annotated[str, typer.Argument(help="URL to probe")]) -> None:
+    """Show what a server answers (status, key headers, body start) to explain access errors."""
+    c: Ctx = ctx.obj
+    result = c.engine.diagnose(url)
+    if c.json:
+        console.print_json(json.dumps(result))
+        return
+    console.print(f"{result['url']} -> HTTP {result['status']}", markup=False, highlight=False)
+    if result["challenge"]:
+        console.print("This is a human-verification (bot protection) page.", style="yellow")
+    for k, v in result["headers"].items():
+        console.print(f"  {k}: {v}", markup=False, highlight=False)
+    if result["body_snippet"]:
+        console.print(
+            "  body: " + result["body_snippet"].replace("\n", " ")[:600],
+            markup=False,
+            highlight=False,
+        )
+
+
 # -- transcribe / transcript / digest ---------------------------------------------------
 
 

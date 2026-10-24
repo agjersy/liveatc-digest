@@ -143,3 +143,39 @@ def test_stations_from_html_option(home, search_html):
     result = runner.invoke(cli.app, ["--json", "stations", "KBED", "--from-html", str(page)])
     assert result.exit_code == 0, result.output
     assert len(json.loads(result.stdout)) == 2
+
+
+def test_import_then_transcribe_offline(home, session, monkeypatch):
+    from liveatc_digest import engine as engine_mod
+    from tests.audio_fixtures import write_bursts
+    from tests.test_engine import FakeAsr, _FrozenDatetime
+
+    _wire(monkeypatch, session)
+    monkeypatch.setattr("liveatc_digest.sources.liveatc.archive.datetime", _FrozenDatetime)
+    monkeypatch.setattr(engine_mod, "make_provider", lambda *_a, **_k: FakeAsr())
+    home.mkdir(parents=True, exist_ok=True)
+    wav = write_bursts(home / "tmp.wav", [(1.0, 2.5)], total_s=4.0)
+    mp3 = home / "KBED-Twr-Jul-28-2024-0000Z.mp3"
+    mp3.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00" + wav.read_bytes())  # mp3 magic + data
+
+    result = runner.invoke(cli.app, ["--json", "import", str(mp3), "--station", "kbed_twr"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["start_utc"] == "2024-07-28T00:00:00Z"
+    assert session.calls == []  # no station page, no archive download
+
+    result = runner.invoke(
+        cli.app,
+        ["--json", "fetch", "kbed_twr", "--from", "2024-07-28T00:00Z", "--to", "2024-07-28T00:30Z"],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)[0]["cached"] is True
+    assert session.calls == []
+
+
+def test_diagnose_command(home, session, monkeypatch):
+    _wire(monkeypatch, session)
+    session.add("https://example.test/a.mp3", FakeResponse(403, b"<title>Just a moment...</title>"))
+    result = runner.invoke(cli.app, ["--json", "diagnose", "https://example.test/a.mp3"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["status"] == 403 and data["challenge"] is True

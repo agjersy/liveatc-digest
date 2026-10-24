@@ -61,3 +61,23 @@ latc transcribe kbed_twr --from 2026-10-23T18:00Z --to 2026-10-23T19:00Z --archi
 ```
 
 Once a feed is registered, `fetch`, `transcribe`, and `digest` never touch the protected pages.
+
+## If the recording download itself returns HTTP 403
+
+Check what the archive host is actually sending back:
+
+```
+latc diagnose https://archive.liveatc.net/kbed/KBED-Twr-Oct-24-2026-0000Z.mp3
+```
+
+If it reports a human-verification page, or LiveATC refuses non-browser downloads, download the
+file in your browser from the feed's archive page and import it. Everything downstream then
+runs offline:
+
+```
+latc import ~/Downloads/KBED-Twr-Oct-24-2026-0000Z.mp3 --station kbed_twr
+latc transcribe kbed_twr --from 2026-10-24T00:00Z --to 2026-10-24T00:30Z
+```
+
+The archive ID and block start are read from the filename; pass `--archive-id` and `--start`
+if you renamed the file. Please review LiveATC's terms of use before automating any access.

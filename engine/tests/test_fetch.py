@@ -72,3 +72,39 @@ def test_plain_403_is_a_normal_http_error(session):
     with pytest.raises(HttpError) as exc:
         client.get_text("https://example.test/x")
     assert not isinstance(exc.value, ChallengeError)
+
+
+def test_parse_archive_filename():
+    from liveatc_digest.sources.liveatc import parse_archive_filename
+
+    archive_id, block = parse_archive_filename("/x/KPDX3-Twr-123775-Oct-01-2021-2000Z.mp3")
+    assert archive_id == "KPDX3-Twr-123775"
+    assert block.start_utc == datetime(2021, 10, 1, 20, 0, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        parse_archive_filename("recording.mp3")
+
+
+def test_import_block_then_fetch_is_offline(client, session, cache, store, tmp_path):
+    from liveatc_digest.sources.liveatc import import_block
+
+    src = tmp_path / "KBED-Twr-Jul-28-2024-0000Z.mp3"
+    src.write_bytes(MP3)
+    imported = import_block(cache, store, "KBED", "KBED-Twr", BLOCK, src)
+    assert imported.url == URL and src.exists()  # original file is left in place
+    fetched = fetch_block(client, cache, store, "KBED", "KBED-Twr", BLOCK, now=NOW)
+    assert fetched.cached and fetched.sha256 == imported.sha256
+    assert session.calls == []
+
+
+def test_403_download_mentions_diagnose(client, session, cache, store):
+    session.add(URL, FakeResponse(403, b"Forbidden", "text/plain"))
+    with pytest.raises(ArchiveNotAvailable) as exc:
+        fetch_block(client, cache, store, "KBED", "KBED-Twr", BLOCK, now=NOW)
+    assert "latc diagnose" in exc.value.reason and "latc import" in exc.value.reason
+
+
+def test_probe_reports_challenge(client, session):
+    body = b"<html><title>Just a moment...</title></html>"
+    session.add(URL, FakeResponse(403, body, "text/html"))
+    result = client.probe(URL)
+    assert result.status == 403 and result.challenge and "Just a moment" in result.body_snippet

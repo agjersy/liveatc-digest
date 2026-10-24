@@ -7,6 +7,8 @@ from .archive import (
     archive_url,
     block_status,
     fetch_block,
+    import_block,
+    parse_archive_filename,
     plan_blocks,
     resolve_archive_id,
 )
@@ -25,7 +27,9 @@ __all__ = [
     "block_status",
     "fetch_block",
     "fetch_stations",
+    "import_block",
     "infer_role",
+    "parse_archive_filename",
     "parse_stations",
     "plan_blocks",
     "resolve_archive_id",

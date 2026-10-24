@@ -273,6 +273,52 @@ class Engine:
         self.store.audit("fetch.blocks", mount, start=iso(start), end=iso(end), count=len(outcomes))
         return outcomes
 
+    def import_recording(
+        self,
+        path: Path,
+        mount: str,
+        icao: str | None = None,
+        archive_id: str | None = None,
+        start: datetime | None = None,
+    ) -> BlockOutcome:
+        """Take a LiveATC MP3 the person downloaded and register it as a fetched block.
+
+        Archive ID and block start default to what the filename says
+        (``KBED-Twr-Oct-24-2026-0000Z.mp3``); pass them explicitly for renamed files.
+        """
+        airport = self.icao_for(mount, icao)
+        parsed_id: str | None = None
+        parsed_block: liveatc.Block | None = None
+        try:
+            parsed_id, parsed_block = liveatc.parse_archive_filename(path.name)
+        except ValueError:
+            if archive_id is None or start is None:
+                raise ValueError(
+                    f"{path.name} is not a LiveATC archive filename; pass --archive-id and --start"
+                ) from None
+        archive_id = archive_id or parsed_id
+        block = liveatc.Block(liveatc.archive.floor_to_block(start)) if start else parsed_block
+        assert archive_id and block
+        row = self._station_row(mount, airport, archive_id)
+        fetched = liveatc.import_block(self.cache, self.store, airport, archive_id, block, path)
+        rec = self.store.find_fetch(fetched.url, liveatc.archive.PROVIDER)
+        bid = self.store.upsert_audio_block(
+            row["id"],
+            airport,
+            iso(block.start_utc),
+            iso(block.end_utc),
+            "fetched",
+            rec.id if rec else None,
+        )
+        self.store.audit("import.block", mount, block=iso(block.start_utc), file=str(path))
+        return BlockOutcome(
+            block.start_utc, "fetched", bid, fetched.path, fetched.sha256, True, url=fetched.url
+        )
+
+    def diagnose(self, url: str) -> dict[str, Any]:
+        """Report what a URL answers with, for troubleshooting access problems."""
+        return self.client.probe(url).summary()
+
     # -- transcribe -------------------------------------------------------------------------
 
     def transcribe(
