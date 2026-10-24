@@ -112,3 +112,34 @@ def test_transcribe_and_digest_commands(home, session, search_html, archive_html
     assert json.loads(result.stdout)[0]["kind"] == "digest"
     result = runner.invoke(cli.app, ["report", "show", "1"])
     assert "## Chronology" in result.stdout
+
+
+def test_station_add_and_list(home):
+    result = runner.invoke(
+        cli.app,
+        [
+            "station",
+            "add",
+            "kbed_twr",
+            "--icao",
+            "KBED",
+            "--archive-id",
+            "KBED-Twr",
+            "--freq",
+            "118.5:Hanscom Tower",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(cli.app, ["--json", "station", "list"])
+    rows = json.loads(result.stdout)
+    assert rows[0]["identifier"] == "kbed_twr" and rows[0]["archive_id"] == "KBED-Twr"
+    assert json.loads(rows[0]["frequencies_json"]) == [{"title": "Hanscom Tower", "mhz": "118.5"}]
+
+
+def test_stations_from_html_option(home, search_html):
+    page = home / "kbed.html"
+    home.mkdir(parents=True, exist_ok=True)
+    page.write_text(search_html)
+    result = runner.invoke(cli.app, ["--json", "stations", "KBED", "--from-html", str(page)])
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.stdout)) == 2

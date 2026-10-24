@@ -52,3 +52,23 @@ def test_http_retries_on_connection_error(session, network_error):
     client = HttpClient("t", retries=2, session=session, sleep=lambda s: None)
     assert client.get_text(URL) == "ok"
     assert session.calls.count(URL) == 2
+
+
+def test_challenge_page_is_reported_distinctly(session):
+    from liveatc_digest.http import ChallengeError
+
+    body = b"<html><title>Just a moment...</title><div id='cf-chl'></div></html>"
+    session.add("https://www.liveatc.net/search/?icao=kbed", FakeResponse(403, body, "text/html"))
+    client = HttpClient("t", session=session, sleep=lambda s: None)
+    with pytest.raises(ChallengeError):
+        client.get_text("https://www.liveatc.net/search/?icao=kbed")
+
+
+def test_plain_403_is_a_normal_http_error(session):
+    from liveatc_digest.http import ChallengeError, HttpError
+
+    session.add("https://example.test/x", FakeResponse(403, b"forbidden", "text/plain"))
+    client = HttpClient("t", session=session, sleep=lambda s: None)
+    with pytest.raises(HttpError) as exc:
+        client.get_text("https://example.test/x")
+    assert not isinstance(exc.value, ChallengeError)

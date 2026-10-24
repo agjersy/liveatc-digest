@@ -19,7 +19,7 @@ from .audio import (
     segment_audio,
 )
 from .cache import Cache
-from .http import HttpClient
+from .http import ChallengeError, HttpClient
 from .llm import LlmProvider, make_llm
 from .nlp import classify_phase, extract_callsigns, extract_events, normalize_text
 from .report import DigestInput, DigestResult, UtteranceView, build_digest
@@ -89,6 +89,26 @@ class SavedDigest:
     utterance_count: int
 
 
+class StationUnavailable(LookupError):
+    """A station could not be resolved automatically; the message says what to do instead."""
+
+
+GUIDANCE = """\
+LiveATC's station pages are behind a human-verification check that this tool does not try to
+get around. Alternatives:
+  1. Register the feed yourself (no page scraping is needed afterwards):
+       latc station add {mount} --icao {icao} --archive-id <ID> --role tower
+     The archive ID is the filename prefix of any recording on the feed's archive page,
+     e.g. KBED-Twr for KBED-Twr-Oct-23-2026-1800Z.mp3.
+  2. Open https://www.liveatc.net/search/?icao={icao_lower} in your browser, save the page as
+     HTML, then run: latc stations {icao} --from-html <saved-file.html>
+  3. Pass --archive-id <ID> directly to `latc fetch` or `latc transcribe`."""
+
+
+def _guidance(mount: str, icao: str) -> str:
+    return GUIDANCE.format(mount=mount, icao=icao.upper(), icao_lower=icao.lower())
+
+
 class Engine:
     def __init__(
         self,
@@ -132,8 +152,17 @@ class Engine:
 
     # -- stations ---------------------------------------------------------------------------
 
-    def stations(self, icao: str) -> list[liveatc.Station]:
-        found = liveatc.fetch_stations(self.client, icao)
+    def stations(self, icao: str, html: str | None = None) -> list[liveatc.Station]:
+        """Discover feeds for an airport from LiveATC, or from *html* the person saved."""
+        if html is not None:
+            found = liveatc.parse_stations(html, icao)
+        else:
+            try:
+                found = liveatc.fetch_stations(self.client, icao)
+            except ChallengeError as exc:
+                raise StationUnavailable(
+                    f"{exc}\n{_guidance(icao.lower() + '_twr', icao)}"
+                ) from exc
         for st in found:
             self.store.upsert_station(
                 st.icao,
@@ -146,16 +175,42 @@ class Engine:
         self.store.audit("stations.list", icao.upper(), count=len(found))
         return found
 
-    def _station_row(self, mount: str, icao: str):
+    def add_station(
+        self,
+        mount: str,
+        icao: str,
+        archive_id: str,
+        title: str | None = None,
+        role: str | None = None,
+        frequencies: list[dict[str, str]] | None = None,
+    ) -> int:
+        """Register a feed by hand so fetch/transcribe need no LiveATC HTML pages."""
+        role = role or str(liveatc.infer_role(mount, title or ""))
+        sid = self.store.upsert_station(
+            icao, mount, title or mount, role, True, frequencies or [], archive_id
+        )
+        self.store.audit("station.add", mount, icao=icao.upper(), archive_id=archive_id)
+        return sid
+
+    def _station_row(self, mount: str, icao: str, archive_id: str | None = None):
         row = self.store.get_station(mount)
+        if row is None and archive_id:
+            self.add_station(mount, icao, archive_id)
+            row = self.store.get_station(mount)
         if row is None:
             self.stations(icao)
             row = self.store.get_station(mount)
         if row is None:
-            raise LookupError(f"unknown station {mount!r} for {icao.upper()}")
-        if not row["archive_id"]:
-            archive_id = liveatc.resolve_archive_id(self.client, mount)
+            raise StationUnavailable(f"unknown station {mount!r} for {icao.upper()}")
+        if archive_id and row["archive_id"] != archive_id:
             self.store.set_station_archive_id(mount, archive_id)
+            row = self.store.get_station(mount)
+        if not row["archive_id"]:
+            try:
+                resolved = liveatc.resolve_archive_id(self.client, mount)
+            except ChallengeError as exc:
+                raise StationUnavailable(f"{exc}\n{_guidance(mount, icao)}") from exc
+            self.store.set_station_archive_id(mount, resolved)
             row = self.store.get_station(mount)
         return row
 
@@ -166,10 +221,15 @@ class Engine:
     # -- fetch ------------------------------------------------------------------------------
 
     def fetch(
-        self, mount: str, start: datetime, end: datetime, icao: str | None = None
+        self,
+        mount: str,
+        start: datetime,
+        end: datetime,
+        icao: str | None = None,
+        archive_id: str | None = None,
     ) -> list[BlockOutcome]:
         airport = self.icao_for(mount, icao)
-        row = self._station_row(mount, airport)
+        row = self._station_row(mount, airport, archive_id)
         retention = self.settings.liveatc.retention_days
         outcomes: list[BlockOutcome] = []
         for block in liveatc.plan_blocks(start, end):
@@ -225,15 +285,16 @@ class Engine:
         model: str | None = None,
         force: bool = False,
         segment_kwargs: dict[str, Any] | None = None,
+        archive_id: str | None = None,
     ) -> list[TranscribeOutcome]:
         airport = self.icao_for(mount, icao)
-        row = self._station_row(mount, airport)
+        row = self._station_row(mount, airport, archive_id)
         asr = self._asr_factory(self.settings, provider, model)
         prompt = build_domain_prompt(airport, row["title"], json.loads(row["frequencies_json"]))
         feed_role = row["role"]
         outcomes: list[TranscribeOutcome] = []
 
-        for block in self.fetch(mount, start, end, airport):
+        for block in self.fetch(mount, start, end, airport, archive_id):
             if block.status != "fetched" or block.path is None:
                 outcomes.append(TranscribeOutcome(block, 0))
                 continue

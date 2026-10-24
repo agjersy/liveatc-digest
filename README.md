@@ -39,3 +39,25 @@ Use `--no-llm` for a deterministic digest without any API calls.
 LiveATC keeps archives for about 30 days; `latc fetch` reports blocks outside that window
 as `expired` without contacting the server. Everything is stored under the platform user
 data directory, or under `$LIVEATC_DIGEST_HOME` when set.
+
+## If `latc stations` reports a human-verification page
+
+LiveATC's HTML pages (the airport search and the per-feed archive page) sit behind
+bot protection that answers automated requests with a human-verification challenge. The tool
+detects this and does **not** try to get around it. The recordings themselves live on
+`archive.liveatc.net` and are fetched directly, so you only need to tell the tool which feed
+and archive ID to use:
+
+```
+# 1. Register the feed once by hand. The archive ID is the filename prefix of any recording
+#    listed on the feed's archive page, e.g. KBED-Twr for KBED-Twr-Oct-23-2026-1800Z.mp3.
+latc station add kbed_twr --icao KBED --archive-id KBED-Twr --role tower --freq 118.5:Tower
+
+# 2. ...or import the search page you opened in your own browser (File > Save Page As).
+latc stations KBED --from-html ~/Downloads/kbed.html
+
+# 3. ...or pass the archive ID straight to fetch/transcribe.
+latc transcribe kbed_twr --from 2026-10-23T18:00Z --to 2026-10-23T19:00Z --archive-id KBED-Twr
+```
+
+Once a feed is registered, `fetch`, `transcribe`, and `digest` never touch the protected pages.

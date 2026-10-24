@@ -114,6 +114,11 @@ Keys are stored in the OS keychain (`keyring`), never in the database or project
 
 ### 4.1 `sources/liveatc`
 - `list_stations(icao) -> [Station]` (existing scraper, hardened with caching and retry).
+  LiveATC's HTML pages are behind bot protection that can answer with a human-verification
+  page. The engine detects this (`ChallengeError`) and **does not attempt to bypass it**; it
+  tells the person to register the feed manually (`latc station add`), import a page they
+  opened in their own browser (`--from-html`), or pass `--archive-id`. Recordings are
+  downloaded directly from `archive.liveatc.net`, which needs none of those pages.
 - `plan_blocks(station, start_utc, end_utc) -> [Block]`: expands a time range into 30-minute
   archive blocks aligned to :00/:30 Z.
 - `fetch_block(block) -> Path`: content-addressed cache under `~/.liveatc-digest/cache/audio/`.

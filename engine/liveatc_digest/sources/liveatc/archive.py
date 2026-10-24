@@ -159,7 +159,8 @@ def fetch_block(
     try:
         result = client.download(url, tmp)
     except HttpError as exc:
-        raise ArchiveNotAvailable(url, f"HTTP {exc.status}") from exc
+        reason = f"HTTP {exc.status}" if exc.status is not None else f"network error: {exc}"
+        raise ArchiveNotAvailable(url, reason) from exc
     if result.size == 0 or not _looks_like_mp3(tmp, result.content_type):
         tmp.unlink(missing_ok=True)
         raise ArchiveNotAvailable(url, "response was not an MP3 (feed may have been down)")

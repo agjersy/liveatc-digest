@@ -23,6 +23,29 @@ class HttpError(RuntimeError):
         super().__init__(message or f"{url} -> {status}")
 
 
+class ChallengeError(HttpError):
+    """The site answered with a bot-protection (human verification) page instead of content.
+
+    We do not try to get past these. Callers surface the alternatives: register the station
+    manually or import a page the person opened in their own browser.
+    """
+
+    def __init__(self, url: str, status: int) -> None:
+        super().__init__(url, status, f"{url} -> {status} (human-verification page)")
+
+
+_CHALLENGE_MARKERS = ("just a moment", "cf-chl", "challenge-platform", "verify you are human")
+
+
+def looks_like_challenge(status: int, headers, body: str) -> bool:
+    if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+    if status in (403, 429, 503):
+        head = (body or "")[:4000].lower()
+        return any(m in head for m in _CHALLENGE_MARKERS)
+    return False
+
+
 @dataclass
 class DownloadResult:
     path: Path
@@ -65,6 +88,8 @@ class HttpClient:
 
     def get_text(self, url: str) -> str:
         resp = self._request("GET", url)
+        if looks_like_challenge(resp.status_code, resp.headers, resp.text):
+            raise ChallengeError(url, resp.status_code)
         if resp.status_code != 200:
             raise HttpError(url, resp.status_code)
         return resp.text
@@ -72,6 +97,8 @@ class HttpClient:
     def download(self, url: str, dest: Path, chunk_size: int = 1 << 16) -> DownloadResult:
         resp = self._request("GET", url, stream=True)
         if resp.status_code != 200:
+            if looks_like_challenge(resp.status_code, resp.headers, ""):
+                raise ChallengeError(url, resp.status_code)
             raise HttpError(url, resp.status_code)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".part")

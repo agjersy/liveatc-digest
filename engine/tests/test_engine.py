@@ -128,3 +128,57 @@ class _FrozenDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
         return datetime(2024, 7, 29, 0, 0, tzinfo=UTC)
+
+
+def test_manual_station_avoids_html_pages(tmp_path, session, monkeypatch):
+    """With --archive-id or `station add`, no search/archive page is ever requested."""
+    monkeypatch.setattr("liveatc_digest.sources.liveatc.archive.datetime", _FrozenDatetime)
+    settings = Settings(cache_dir=tmp_path / "cache", workspace_db=tmp_path / "ws.sqlite")
+    wav = write_bursts(tmp_path / "block.wav", [(1.0, 2.5)], total_s=4.0)
+    session.add(URL, FakeResponse(200, wav.read_bytes(), "audio/mpeg"))
+    eng = Engine(
+        settings,
+        store=Store(settings.workspace_db),
+        cache=Cache(settings.cache_dir),
+        client=HttpClient("t", session=session, sleep=lambda s: None),
+        asr_factory=lambda *_a, **_k: FakeAsr(),
+    )
+    outcomes = eng.fetch("kbed_twr", START, END, archive_id="KBED-Twr")
+    assert outcomes[0].status == "fetched"
+    assert session.calls == [URL]
+    row = eng.store.get_station("kbed_twr")
+    assert row["archive_id"] == "KBED-Twr" and row["role"] == "tower" and row["icao"] == "KBED"
+
+
+def test_challenge_gives_guidance(tmp_path, session):
+    from liveatc_digest.engine import StationUnavailable
+
+    settings = Settings(cache_dir=tmp_path / "cache", workspace_db=tmp_path / "ws.sqlite")
+    body = b"<html><title>Just a moment...</title>verify you are human</html>"
+    session.add("https://www.liveatc.net/search/?icao=kbed", FakeResponse(403, body))
+    eng = Engine(
+        settings,
+        store=Store(settings.workspace_db),
+        cache=Cache(settings.cache_dir),
+        client=HttpClient("t", session=session, sleep=lambda s: None),
+    )
+    try:
+        eng.stations("KBED")
+    except StationUnavailable as exc:
+        msg = str(exc)
+    else:
+        raise AssertionError("expected StationUnavailable")
+    assert "latc station add kbed_twr --icao KBED" in msg and "--from-html" in msg
+
+
+def test_stations_from_saved_html(tmp_path, session, search_html):
+    settings = Settings(cache_dir=tmp_path / "cache", workspace_db=tmp_path / "ws.sqlite")
+    eng = Engine(
+        settings,
+        store=Store(settings.workspace_db),
+        cache=Cache(settings.cache_dir),
+        client=HttpClient("t", session=session, sleep=lambda s: None),
+    )
+    found = eng.stations("KBED", html=search_html)
+    assert [s.identifier for s in found] == ["kbed_twr", "kbed_app"]
+    assert session.calls == []

@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .. import __version__, config, paths
-from ..engine import Engine, iso
+from ..engine import Engine, StationUnavailable, iso
 from ..http import HttpError
 from ..sources import liveatc
 
@@ -26,10 +26,12 @@ config_app = typer.Typer(help="View and edit settings and API keys.", no_args_is
 db_app = typer.Typer(help="Workspace database.", no_args_is_help=True)
 cache_app = typer.Typer(help="Raw download cache.", no_args_is_help=True)
 report_app = typer.Typer(help="Saved digests and reports.", no_args_is_help=True)
+station_app = typer.Typer(help="Manually registered feeds.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(db_app, name="db")
 app.add_typer(cache_app, name="cache")
 app.add_typer(report_app, name="report")
+app.add_typer(station_app, name="station")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -67,6 +69,13 @@ def parse_utc(value: str) -> datetime:
 FromOpt = Annotated[str, typer.Option("--from", help="Start UTC, e.g. 2024-07-28T00:00Z")]
 ToOpt = Annotated[str, typer.Option("--to", help="End UTC (exclusive)")]
 IcaoOpt = Annotated[str | None, typer.Option(help="Airport ICAO (default: from the mount)")]
+ArchiveIdOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--archive-id",
+        help="LiveATC archive filename prefix, e.g. KBED-Twr (skips the station pages)",
+    ),
+]
 
 
 @app.callback()
@@ -91,11 +100,21 @@ def version() -> None:
 
 @app.command()
 def stations(
-    ctx: typer.Context, icao: Annotated[str, typer.Argument(help="Airport ICAO, e.g. KBED")]
+    ctx: typer.Context,
+    icao: Annotated[str, typer.Argument(help="Airport ICAO, e.g. KBED")],
+    from_html: Annotated[
+        Path | None,
+        typer.Option("--from-html", help="Parse a LiveATC search page you saved from your browser"),
+    ] = None,
 ) -> None:
     """List LiveATC feeds for an airport and remember them in the workspace database."""
     c: Ctx = ctx.obj
-    found = c.engine.stations(icao)
+    html = from_html.read_text(encoding="utf-8", errors="replace") if from_html else None
+    try:
+        found = c.engine.stations(icao, html)
+    except StationUnavailable as exc:
+        err_console.print(str(exc), style="red", markup=False, highlight=False)
+        raise typer.Exit(code=2) from None
     payload = [
         {
             "icao": st.icao,
@@ -135,13 +154,14 @@ def fetch(
     start: FromOpt,
     end: ToOpt,
     icao: IcaoOpt = None,
+    archive_id: ArchiveIdOpt = None,
 ) -> None:
     """Download the 30-minute archive blocks covering a UTC window into the cache."""
     c: Ctx = ctx.obj
     try:
-        outcomes = c.engine.fetch(station, parse_utc(start), parse_utc(end), icao)
+        outcomes = c.engine.fetch(station, parse_utc(start), parse_utc(end), icao, archive_id)
     except LookupError as exc:
-        err_console.print(f"[red]{exc}[/red]")
+        err_console.print(str(exc), style="red", markup=False, highlight=False)
         raise typer.Exit(code=2) from None
     results = [o.as_dict() for o in outcomes]
 
@@ -180,15 +200,23 @@ def transcribe(
     force: Annotated[
         bool, typer.Option("--force", help="Re-transcribe blocks that already have utterances")
     ] = False,
+    archive_id: ArchiveIdOpt = None,
 ) -> None:
     """Fetch (if needed), segment, and transcribe a window into UTC-stamped utterances."""
     c: Ctx = ctx.obj
     try:
         outcomes = c.engine.transcribe(
-            station, parse_utc(start), parse_utc(end), icao, asr, model, force
+            station,
+            parse_utc(start),
+            parse_utc(end),
+            icao,
+            asr,
+            model,
+            force,
+            archive_id=archive_id,
         )
     except LookupError as exc:
-        err_console.print(f"[red]{exc}[/red]")
+        err_console.print(str(exc), style="red", markup=False, highlight=False)
         raise typer.Exit(code=2) from None
     results = [o.as_dict() for o in outcomes]
 
@@ -312,6 +340,67 @@ def reextract(
     c: Ctx = ctx.obj
     n = c.engine.reextract(icao, parse_utc(start), parse_utc(end))
     console.print(f"Re-extracted {n} utterances.")
+
+
+# -- stations (manual) ------------------------------------------------------------------
+
+
+@station_app.command("add")
+def station_add(
+    ctx: typer.Context,
+    mount: Annotated[str, typer.Argument(help="LiveATC mount name, e.g. kbed_twr")],
+    icao: Annotated[str, typer.Option("--icao", help="Airport ICAO, e.g. KBED")],
+    archive_id: Annotated[
+        str, typer.Option("--archive-id", help="Recording filename prefix, e.g. KBED-Twr")
+    ],
+    title: Annotated[str | None, typer.Option(help="Display title")] = None,
+    role: Annotated[
+        str | None, typer.Option(help="clearance|ground|tower|approach|departure|center|ctaf|atis")
+    ] = None,
+    freq: Annotated[
+        list[str] | None,
+        typer.Option("--freq", help="Frequency as MHZ:Title, repeatable (e.g. 118.5:Tower)"),
+    ] = None,
+) -> None:
+    """Register a feed by hand so fetch/transcribe never need LiveATC's HTML pages."""
+    c: Ctx = ctx.obj
+    frequencies = []
+    for item in freq or []:
+        mhz, _, label = item.partition(":")
+        frequencies.append({"title": label or mount, "mhz": mhz})
+    c.engine.add_station(mount, icao, archive_id, title, role, frequencies)
+    console.print(f"Registered {mount} ({icao.upper()}, archive id {archive_id}).")
+
+
+@station_app.command("set-archive-id")
+def station_set_archive_id(ctx: typer.Context, mount: str, archive_id: str) -> None:
+    """Set or correct the archive filename prefix for a known feed."""
+    c: Ctx = ctx.obj
+    if c.engine.store.get_station(mount) is None:
+        err_console.print(f"[red]Unknown station {mount!r}; use `latc station add`.[/red]")
+        raise typer.Exit(code=2)
+    c.engine.store.set_station_archive_id(mount, archive_id)
+    console.print(f"{mount}: archive id set to {archive_id}.")
+
+
+@station_app.command("list")
+def station_list(ctx: typer.Context) -> None:
+    """Show feeds known to the workspace database."""
+    c: Ctx = ctx.obj
+    rows = [
+        dict(r)
+        for r in c.engine.store.conn.execute("SELECT * FROM station ORDER BY icao, identifier")
+    ]
+
+    def render() -> None:
+        table = Table(title="Known feeds")
+        for col in ("ICAO", "Mount", "Role", "Archive ID", "Title"):
+            table.add_column(col)
+        for r in rows:
+            table.add_row(r["icao"], r["identifier"], r["role"], r["archive_id"] or "?", r["title"])
+        console.print(table)
+
+    _emit(c, rows, render)
 
 
 # -- reports ----------------------------------------------------------------------------
