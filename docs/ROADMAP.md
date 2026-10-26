@@ -39,6 +39,8 @@ safety safeguards exist before any accident-related output is produced.
 **Done when:** an aircraft cleared for an approach shows its track over that procedure.
 
 ## Phase 4 — NTSB case toolkit
+
+Superseded in detail by [NTSB_CASE_STUDY_SPEC.md](NTSB_CASE_STUDY_SPEC.md) (phases A–E).
 - CAROL client + monthly database fallback; docket document fetch and transcript detection.
 - Case builder pipeline; fixed report template; quote check for findings/probable cause.
 - Data-gap reporting. Watch mode: daily poll of NTSB prelims / FAA ASIAS, auto-archive

@@ -11,6 +11,8 @@ LLM narrative is checked by a grounding validator before it is saved as a report
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system design, data sources, safeguards,
   data model, decisions log.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — phased delivery plan.
+- [docs/NTSB_CASE_STUDY_SPEC.md](docs/NTSB_CASE_STUDY_SPEC.md) — NTSB case-study tool:
+  search, cited summaries, FAA reference retrieval, 3D ADS-B trajectory map, educational chat.
 
 ## Layout
 

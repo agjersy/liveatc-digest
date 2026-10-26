@@ -270,6 +270,10 @@ Long jobs are resumable (job state is in the database).
 
 ## 7. NTSB case reconstruction toolkit — safeguards
 
+The full product and architecture specification for this tool, including search, FAA
+reference retrieval, the 3D trajectory map, and the educational chat, is in
+[NTSB_CASE_STUDY_SPEC.md](NTSB_CASE_STUDY_SPEC.md). The safeguards below remain in force.
+
 ### 7.1 Scope
 Input is an NTSB case identifier or (registration, date). Output is a reconstruction plus a
 report. The toolkit never searches for "similar accidents" or draws comparisons on its own.
